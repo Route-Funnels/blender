@@ -1,0 +1,92 @@
+name: CodeTether Windows Blender Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_args:
+        description: 'Arguments passed to make.bat'
+        required: false
+        default: 'lite x64 2022 ninja verbose'
+
+jobs:
+  build-windows:
+    name: Build Windows Blender on large runner
+    # Larger GitHub-hosted Windows runner. If unavailable for the fork/org,
+    # change to windows-latest or another configured larger-runner label.
+    runs-on: windows-latest-16-cores
+    timeout-minutes: 360
+
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+      BUILD_ARGS: ${{ inputs.build_args }}
+      CODETETHER_PACKAGE_NAME: blender-codetether-windows-x64
+
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+          submodules: false
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install ninja cmake git-lfs -y --no-progress
+          git lfs install --skip-smudge
+          ninja --version
+          cmake --version
+
+      - name: Fetch Blender Windows libraries
+        shell: pwsh
+        run: |
+          git submodule update --init --depth 1 scripts/addons_core
+          git config --local submodule.lib/windows_x64.update checkout
+          $env:GIT_LFS_SKIP_SMUDGE = '1'
+          git submodule update --progress --init lib/windows_x64
+          Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
+          git -C lib/windows_x64 lfs pull
+
+      - name: Build Blender
+        shell: cmd
+        run: |
+          echo BUILD_ARGS=%BUILD_ARGS%
+          call make.bat %BUILD_ARGS%
+
+      - name: Locate and smoke test blender.exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path .. -Recurse -Filter blender.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'build_windows.*(bin|Release|install)' } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $exe) { throw 'Could not locate blender.exe after build' }
+          echo "BLENDER_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $exe.FullName --version
+          '{"jsonrpc":"2.0","id":1,"method":"status","params":{}}' |
+            & $exe.FullName --background --agent-mcp | Tee-Object -FilePath agent_mcp_smoke_test_windows.json
+          if (-not (Select-String -Path agent_mcp_smoke_test_windows.json -Pattern '"blender_version"' -Quiet)) {
+            throw 'Agent MCP smoke test did not report blender_version'
+          }
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $exe = Get-Item $env:BLENDER_EXE
+          $pkg = Join-Path $pwd 'blender-codetether-windows-x64'
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item -Path (Join-Path $exe.Directory.FullName '*') -Destination $pkg -Recurse -Force
+          Copy-Item agent_mcp_smoke_test_windows.json -Destination $pkg -Force
+          Copy-Item tools/codetether_blender_automation.py -Destination (Join-Path $pkg 'codetether_blender_automation.py') -Force
+          Compress-Archive -Path (Join-Path $pkg '*') -DestinationPath blender-codetether-windows-x64.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-codetether-windows-x64
+          path: blender-codetether-windows-x64.zip
+          if-no-files-found: error

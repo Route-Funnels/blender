@@ -36,11 +36,16 @@ function Invoke-DownloadWithRetry($Uri, $OutFile, $Attempts = 5) {
 }
 
 function ConvertTo-CmdArgument([string]$Value) {
-  # Quote for cmd.exe. Escape cmd metacharacters first, then double embedded
-  # quotes for Windows command-line parsing.
+  # Escape for cmd.exe. Only quote when necessary: Blender's make.bat argument
+  # parser compares quoted %1 values directly (for example `"%1" == "release"`),
+  # so passing simple arguments as `"release"` makes them appear as literal
+  # quotes (`""release""`) and fail to match.
   $escaped = $Value -replace '([\^&|<>()])', '^$1'
   $escaped = $escaped -replace '"', '""'
-  return '"' + $escaped + '"'
+  if (($escaped -eq '') -or ($escaped -match '\s')) {
+    return '"' + $escaped + '"'
+  }
+  return $escaped
 }
 
 function Invoke-LoggedCommand {
@@ -94,17 +99,18 @@ function Invoke-LoggedCommand {
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "cmd.exe"
-    [System.IO.File]::WriteAllText($cmdScript, "@echo off`r`n$cmdLine`r`nexit /b %ERRORLEVEL%`r`n")
+    # Redirect inside cmd.exe instead of using ProcessStartInfo pipes. Some
+    # tools (notably `git submodule update --progress`) can emit enough stderr
+    # progress output to fill the OS pipe buffer. Reading stdout to completion
+    # before stderr deadlocks in that situation. Redirecting to files avoids the
+    # pipe buffer entirely while still letting us replay output below.
+    $cmdLineWithRedirect = "$cmdLine 1> " + (ConvertTo-CmdArgument $stdout) + " 2> " + (ConvertTo-CmdArgument $stderr)
+    [System.IO.File]::WriteAllText($cmdScript, "@echo off`r`n$cmdLineWithRedirect`r`nexit /b %ERRORLEVEL%`r`n")
     $psi.Arguments = "/d /c " + (ConvertTo-CmdArgument $cmdScript)
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
     $process = [System.Diagnostics.Process]::Start($psi)
-    $stdOutText = $process.StandardOutput.ReadToEnd()
-    $stdErrText = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
-    [System.IO.File]::WriteAllText($stdout, $stdOutText)
-    [System.IO.File]::WriteAllText($stderr, $stdErrText)
 
     if (Test-Path $stdout) { Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
     if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
@@ -137,7 +143,7 @@ function Copy-FromGcs($Source, $Destination) {
   $parts = Split-GcsUri $Source
   $token = Get-GceAccessToken
   $encodedObject = [System.Uri]::EscapeDataString($parts.Object)
-  $url = "https://storage.googleapis.com/storage/v1/b/$($parts.Bucket)/o/$encodedObject?alt=media"
+  $url = "https://storage.googleapis.com/storage/v1/b/$($parts.Bucket)/o/${encodedObject}?alt=media"
   Write-Log "Downloading $Source to $Destination"
   Invoke-WebRequest `
     -Uri $url `
@@ -152,7 +158,7 @@ function Copy-ToGcs($Source, $Destination) {
   $parts = Split-GcsUri $Destination
   $token = Get-GceAccessToken
   $encodedObject = [System.Uri]::EscapeDataString($parts.Object)
-  $url = "https://storage.googleapis.com/upload/storage/v1/b/$($parts.Bucket)/o?uploadType=media&name=$encodedObject"
+  $url = "https://storage.googleapis.com/upload/storage/v1/b/$($parts.Bucket)/o?uploadType=media&name=${encodedObject}"
   Write-Log "Uploading $Source to $Destination"
   Invoke-WebRequest `
     -Uri $url `
@@ -184,6 +190,7 @@ $ArtifactBucket = "__ARTIFACT_BUCKET__"
 $RepoUrl = "__REPO_URL__"
 $BaseRef = "__BASE_REF__"
 $BuildArgs = "__BUILD_ARGS__"
+$BuildArgList = @($BuildArgs -split '\s+' | Where-Object { $_ })
 $WorkDir = "C:\blender-agent-build"
 $SourceDir = Join-Path $WorkDir "blender-src"
 $OverlayArchive = Join-Path $WorkDir "agent-overlay.tar.gz"
@@ -223,17 +230,45 @@ try {
   }
 
   $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-  $hasVS = (Test-Path $vswhere) -and (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
-  if (-not $hasVS) {
+  $vsInstall = $null
+  if (Test-Path $vswhere) {
+    $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  }
+  if (-not $vsInstall) {
     Write-Log "Installing Visual Studio 2022 Build Tools"
     $vsInstaller = Join-Path $WorkDir "vs_buildtools.exe"
     Invoke-DownloadWithRetry "https://aka.ms/vs/17/release/vs_BuildTools.exe" $vsInstaller
-    Start-Process -FilePath $vsInstaller -ArgumentList @(
+    $vsArgs = @(
       "--quiet", "--wait", "--norestart", "--nocache",
+      "--installPath", "C:\BuildTools",
       "--add", "Microsoft.VisualStudio.Workload.VCTools",
       "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-      "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621"
-    ) -Wait
+      "--add", "Microsoft.VisualStudio.Component.VC.CMake.Project",
+      "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621",
+      "--includeRecommended"
+    )
+    Write-Log "> $vsInstaller $($vsArgs -join ' ')"
+    $vsProcess = Start-Process -FilePath $vsInstaller -ArgumentList $vsArgs -Wait -PassThru
+    # 0 = success, 3010 = success/reboot required. Build Tools can still be used
+    # in the same startup session after environment refresh.
+    if (($vsProcess.ExitCode -ne 0) -and ($vsProcess.ExitCode -ne 3010)) {
+      throw "Visual Studio Build Tools installer failed with exit code $($vsProcess.ExitCode)"
+    }
+    Add-ToMachinePath "C:\BuildTools\MSBuild\Current\Bin"
+    Add-ToMachinePath "C:\BuildTools\VC\Tools\MSVC"
+  }
+
+  if (-not (Test-Path $vswhere)) {
+    throw "vswhere.exe was not found after Visual Studio Build Tools installation"
+  }
+  $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+  if (-not $vsInstall) {
+    throw "Visual Studio Build Tools with MSVC x64 tools were not found after installation"
+  }
+  Write-Log "Visual Studio Build Tools detected at $vsInstall"
+  $vcvars64 = Join-Path $vsInstall "VC\Auxiliary\Build\vcvars64.bat"
+  if (-not (Test-Path $vcvars64)) {
+    throw "vcvars64.bat was not found at $vcvars64"
   }
 
   Write-Log "Downloading agent overlay from GCS"
@@ -260,7 +295,7 @@ try {
   Push-Location $SourceDir
 
   Write-Log "Building Blender with args: $BuildArgs"
-  Invoke-LoggedCommand cmd.exe /c "make.bat $BuildArgs"
+  Invoke-LoggedCommand .\make.bat @BuildArgList
   Pop-Location
 
   $Exe = Get-ChildItem -Path "C:\" -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |

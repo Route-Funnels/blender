@@ -19,14 +19,18 @@
 #   gs://YOUR_BUCKET/blender-agent-mcp-windows/$BUILD_ID/blender-agent-mcp-windows-x64.zip
 
 substitutions:
-  _ARTIFACT_BUCKET: ""
+  # Default artifact exchange prefix for this project. Override on submit if needed:
+  #   --substitutions=_ARTIFACT_BUCKET=gs://YOUR_BUCKET/blender-agent-mcp-windows
+  _ARTIFACT_BUCKET: "gs://spotlessbinco_cloudbuild/blender-windows"
+  # Primary/default zone and machine type. The create step also tries an
+  # alternate zone/type matrix to work around transient capacity/quota errors.
   _ZONE: "us-central1-a"
-  _MACHINE_TYPE: "c3-standard-22"
+  _MACHINE_TYPE: "n2-standard-16"
   _DISK_SIZE_GB: "300"
   _BOOT_DISK_TYPE: "pd-ssd"
   _REPO_URL: "https://github.com/blender/blender.git"
   _BASE_REF: "ab049163a6d5c937d62ed535b18f9af82de08554"
-  _BUILD_ARGS: "release x64 ninja"
+  _BUILD_ARGS: "release x64 2022b ninja verbose"
   _VM_NAME_PREFIX: "blender-win"
 
 timeout: "28800s" # 8 hours
@@ -97,15 +101,50 @@ steps:
         VM_NAME="$${VM_NAME:0:62}"
         echo "$${VM_NAME}" > /workspace/windows-cloudbuild/vm-name.txt
 
-        gcloud compute instances create "$${VM_NAME}" \
-          --zone="${_ZONE}" \
-          --machine-type="${_MACHINE_TYPE}" \
-          --boot-disk-size="${_DISK_SIZE_GB}GB" \
-          --boot-disk-type="${_BOOT_DISK_TYPE}" \
-          --image-family="windows-2022" \
-          --image-project="windows-cloud" \
-          --scopes="https://www.googleapis.com/auth/cloud-platform" \
-          --metadata-from-file=windows-startup-script-ps1=/workspace/windows-cloudbuild/startup.ps1
+        : > /workspace/windows-cloudbuild/create-vm-errors.txt
+        candidates="${_ZONE}|${_MACHINE_TYPE}
+        us-central1-b|n2-standard-16
+        us-central1-c|n2-standard-16
+        us-central1-f|n2-standard-16
+        us-east1-b|n2-standard-16
+        us-east1-c|n2-standard-16
+        us-east1-d|n2-standard-16
+        us-central1-a|e2-standard-16
+        us-central1-b|e2-standard-16
+        us-central1-c|e2-standard-16
+        us-central1-f|e2-standard-16
+        us-east1-b|e2-standard-16
+        us-east1-c|e2-standard-16
+        us-east1-d|e2-standard-16
+        us-central1-a|n2-standard-8
+        us-central1-b|n2-standard-8
+        us-central1-c|n2-standard-8
+        us-central1-f|n2-standard-8"
+
+        while IFS='|' read -r zone machine_type; do
+          [ -n "$${zone}" ] || continue
+          zone="$$(echo "$${zone}" | xargs)"
+          machine_type="$$(echo "$${machine_type}" | xargs)"
+          echo "Trying Windows builder VM in zone=$${zone} machine_type=$${machine_type}"
+          if gcloud compute instances create "$${VM_NAME}" \
+              --zone="$${zone}" \
+              --machine-type="$${machine_type}" \
+              --boot-disk-size="${_DISK_SIZE_GB}GB" \
+              --boot-disk-type="${_BOOT_DISK_TYPE}" \
+              --image-family="windows-2022" \
+              --image-project="windows-cloud" \
+              --scopes="https://www.googleapis.com/auth/cloud-platform" \
+              --metadata-from-file=windows-startup-script-ps1=/workspace/windows-cloudbuild/startup.ps1; then
+            echo "$${zone}" > /workspace/windows-cloudbuild/vm-zone.txt
+            echo "$${machine_type}" > /workspace/windows-cloudbuild/vm-machine-type.txt
+            exit 0
+          fi
+          echo "Failed zone=$${zone} machine_type=$${machine_type}" >> /workspace/windows-cloudbuild/create-vm-errors.txt
+        done <<< "$${candidates}"
+
+        echo "ERROR: unable to create Windows builder VM in any candidate zone/type." >&2
+        cat /workspace/windows-cloudbuild/create-vm-errors.txt >&2
+        exit 1
 
   - id: "wait-for-windows-artifact"
     name: "gcr.io/cloud-builders/gcloud"
@@ -114,9 +153,10 @@ steps:
       - "-ceu"
       - |
         VM_NAME="$(cat /workspace/windows-cloudbuild/vm-name.txt)"
+        VM_ZONE="$(cat /workspace/windows-cloudbuild/vm-zone.txt)"
         cleanup_vm() {
-          echo "Deleting Windows builder VM $${VM_NAME}"
-          gcloud compute instances delete "$${VM_NAME}" --zone="${_ZONE}" --quiet || true
+          echo "Deleting Windows builder VM $${VM_NAME} in $${VM_ZONE}"
+          gcloud compute instances delete "$${VM_NAME}" --zone="$${VM_ZONE}" --quiet || true
         }
         trap cleanup_vm EXIT
 
@@ -140,7 +180,7 @@ steps:
           sleep 60
         done
         echo "Timed out waiting for Windows artifact" >&2
-        gcloud compute instances get-serial-port-output "$${VM_NAME}" --zone="${_ZONE}" --port=1 | tail -300 || true
+        gcloud compute instances get-serial-port-output "$${VM_NAME}" --zone="$${VM_ZONE}" --port=1 | tail -300 || true
         exit 1
 
   - id: "delete-windows-builder-vm"
@@ -151,5 +191,6 @@ steps:
       - |
         if [ -f /workspace/windows-cloudbuild/vm-name.txt ]; then
           VM_NAME="$(cat /workspace/windows-cloudbuild/vm-name.txt)"
-          gcloud compute instances delete "$${VM_NAME}" --zone="${_ZONE}" --quiet || true
+          VM_ZONE="$(cat /workspace/windows-cloudbuild/vm-zone.txt 2>/dev/null || echo "${_ZONE}")"
+          gcloud compute instances delete "$${VM_NAME}" --zone="$${VM_ZONE}" --quiet || true
         fi
