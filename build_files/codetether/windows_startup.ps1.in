@@ -35,12 +35,76 @@ function Invoke-DownloadWithRetry($Uri, $OutFile, $Attempts = 5) {
   }
 }
 
+function ConvertTo-CmdArgument([string]$Value) {
+  # Quote for cmd.exe. Escape cmd metacharacters first, then double embedded
+  # quotes for Windows command-line parsing.
+  $escaped = $Value -replace '([\^&|<>()])', '^$1'
+  $escaped = $escaped -replace '"', '""'
+  return '"' + $escaped + '"'
+}
+
+function Invoke-LoggedCommand {
+  param(
+    [Parameter(Mandatory=$true)][string]$FilePath,
+    [Parameter(ValueFromRemainingArguments=$true)][string[]]$Arguments
+  )
+
+  Write-Log "> $FilePath $($Arguments -join ' ')"
+
+  # Do not use PowerShell native stderr redirection (`2>&1`) here. With
+  # $ErrorActionPreference='Stop', Windows PowerShell converts native stderr
+  # lines (including gcloud's normal progress text) into terminating errors.
+  # Redirect through ProcessStartInfo files instead, then replay the captured
+  # text into the transcript/log. Run through cmd.exe for every tool so command
+  # shims such as gcloud.cmd, extensionless wrappers, and .bat files all work;
+  # Start-Process cannot execute those reliably as native Win32 applications.
+  $stdout = [System.IO.Path]::GetTempFileName()
+  $stderr = [System.IO.Path]::GetTempFileName()
+  try {
+    $resolved = Get-Command $FilePath -ErrorAction SilentlyContinue
+    if ($resolved -and $resolved.Source) { $resolvedPath = $resolved.Source } else { $resolvedPath = $FilePath }
+
+    $cmdLine = ConvertTo-CmdArgument $resolvedPath
+    foreach ($arg in $Arguments) {
+      $cmdLine += ' ' + (ConvertTo-CmdArgument $arg)
+    }
+    $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $cmdLine) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+    if (Test-Path $stdout) { Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
+    if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
+    $exitCode = $process.ExitCode
+    if ($exitCode -ne 0) {
+      throw "Command failed with exit code ${exitCode}: $FilePath $($Arguments -join ' ')"
+    }
+  }
+  finally {
+    Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Copy-ToGcsBestEffort($Source, $Destination) {
+  try {
+    if (Test-Path $Source) {
+      Write-Log "Uploading $Source to $Destination"
+      try {
+        Invoke-LoggedCommand gcloud storage cp $Source $Destination
+      }
+      catch {
+        Write-Log "WARNING: failed to upload ${Source}: $($_.Exception.Message)"
+      }
+    }
+  }
+  catch {
+    Write-Log "WARNING: unexpected upload helper error for ${Source}: $($_.Exception.Message)"
+  }
+}
+
 $BuildId = "__BUILD_ID__"
 $ArtifactBucket = "__ARTIFACT_BUCKET__"
 $RepoUrl = "__REPO_URL__"
 $BaseRef = "__BASE_REF__"
 $BuildArgs = "__BUILD_ARGS__"
-$WorkDir = "C:\\blender-agent-build"
+$WorkDir = "C:\blender-agent-build"
 $SourceDir = Join-Path $WorkDir "blender-src"
 $OverlayArchive = Join-Path $WorkDir "agent-overlay.tar.gz"
 $ArtifactDir = Join-Path $WorkDir "artifacts"
@@ -57,7 +121,7 @@ try {
     $gitInstaller = Join-Path $WorkDir "Git-64-bit.exe"
     Invoke-DownloadWithRetry "https://github.com/git-for-windows/git/releases/download/v2.51.2.windows.1/Git-2.51.2-64-bit.exe" $gitInstaller
     Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-" -Wait
-    Add-ToMachinePath "C:\\Program Files\\Git\\cmd"
+    Add-ToMachinePath "C:\Program Files\Git\cmd"
   }
 
   if (-not (Get-Command cmake.exe -ErrorAction SilentlyContinue)) {
@@ -65,20 +129,20 @@ try {
     $cmakeMsi = Join-Path $WorkDir "cmake.msi"
     Invoke-DownloadWithRetry "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.msi" $cmakeMsi
     Start-Process msiexec.exe -ArgumentList "/i", $cmakeMsi, "/qn", "/norestart", "ADD_CMAKE_TO_PATH=System" -Wait
-    Add-ToMachinePath "C:\\Program Files\\CMake\\bin"
+    Add-ToMachinePath "C:\Program Files\CMake\bin"
   }
 
   if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
     Write-Log "Installing Ninja"
     $ninjaZip = Join-Path $WorkDir "ninja-win.zip"
-    $ninjaDir = "C:\\ninja"
+    $ninjaDir = "C:\ninja"
     Invoke-DownloadWithRetry "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip" $ninjaZip
     New-Item -ItemType Directory -Force -Path $ninjaDir | Out-Null
     Expand-Archive -Path $ninjaZip -DestinationPath $ninjaDir -Force
     Add-ToMachinePath $ninjaDir
   }
 
-  $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+  $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
   $hasVS = (Test-Path $vswhere) -and (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
   if (-not $hasVS) {
     Write-Log "Installing Visual Studio 2022 Build Tools"
@@ -93,38 +157,33 @@ try {
   }
 
   Write-Log "Downloading agent overlay from GCS"
-  gcloud storage cp "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
+  Invoke-LoggedCommand gcloud storage cp "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
 
   Write-Log "Cloning Blender source"
-  git config --global core.longpaths true
-  git lfs install --skip-smudge
-  git clone --filter=blob:none $RepoUrl $SourceDir
-  git -C $SourceDir checkout $BaseRef
-  git -C $SourceDir submodule update --init --depth 1 scripts/addons_core
+  Invoke-LoggedCommand git config --global core.longpaths true
+  Invoke-LoggedCommand git lfs install --skip-smudge
+  Invoke-LoggedCommand git clone --filter=blob:none $RepoUrl $SourceDir
+  Invoke-LoggedCommand git -C $SourceDir checkout $BaseRef
+  Invoke-LoggedCommand git -C $SourceDir submodule update --init --depth 1 scripts/addons_core
 
   Write-Log "Fetching Windows dependency libraries non-interactively"
-  git -C $SourceDir config --local submodule.lib/windows_x64.update checkout
+  Invoke-LoggedCommand git -C $SourceDir config --local submodule.lib/windows_x64.update checkout
   $env:GIT_LFS_SKIP_SMUDGE = "1"
-  git -C $SourceDir submodule update --progress --init lib/windows_x64
-  if ($LASTEXITCODE -ne 0) { throw "lib/windows_x64 submodule update failed with exit code $LASTEXITCODE" }
+  Invoke-LoggedCommand git -C $SourceDir submodule update --progress --init lib/windows_x64
   Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
-  git -C (Join-Path $SourceDir "lib/windows_x64") lfs pull
-  if ($LASTEXITCODE -ne 0) { throw "lib/windows_x64 git lfs pull failed with exit code $LASTEXITCODE" }
+  Invoke-LoggedCommand git -C (Join-Path $SourceDir "lib/windows_x64") lfs pull
 
   Write-Log "Applying agent overlay"
   tar -xzf $OverlayArchive -C $SourceDir
 
-  Write-Log "Running make.bat update to fetch Windows libraries"
+  Write-Log "Skipping make.bat update because lib/windows_x64 was fetched explicitly above"
   Push-Location $SourceDir
-  cmd.exe /c "make.bat update"
-  if ($LASTEXITCODE -ne 0) { throw "make.bat update failed with exit code $LASTEXITCODE" }
 
   Write-Log "Building Blender with args: $BuildArgs"
-  cmd.exe /c "make.bat $BuildArgs"
-  if ($LASTEXITCODE -ne 0) { throw "make.bat build failed with exit code $LASTEXITCODE" }
+  Invoke-LoggedCommand cmd.exe /c "make.bat $BuildArgs"
   Pop-Location
 
-  $Exe = Get-ChildItem -Path "C:\\" -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |
+  $Exe = Get-ChildItem -Path "C:\" -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match "build_windows.*bin|build_windows.*Release|build_windows.*install" } |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
@@ -149,22 +208,21 @@ try {
   Write-Log "Packaging from $BinDir"
   Copy-Item -Path (Join-Path $BinDir "*") -Destination $PackageRoot -Recurse -Force
   Copy-Item -Path $Smoke -Destination $PackageRoot -Force
-  Copy-Item -Path (Join-Path $SourceDir "tools\\codetether_blender_automation.py") -Destination (Join-Path $PackageRoot "codetether_blender_automation.py") -Force
+  Copy-Item -Path (Join-Path $SourceDir "tools\codetether_blender_automation.py") -Destination (Join-Path $PackageRoot "codetether_blender_automation.py") -Force
 
   $ZipPath = Join-Path $ArtifactDir "blender-agent-mcp-windows-x64.zip"
   Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -Force
   Write-Log "Uploading artifact $ZipPath"
-  gcloud storage cp $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
-  gcloud storage cp $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
+  Invoke-LoggedCommand gcloud storage cp $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
+  Invoke-LoggedCommand gcloud storage cp $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
 
   Write-Log "WINDOWS_BUILD_SUCCESS artifact=$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
 }
 catch {
   Write-Log "WINDOWS_BUILD_FAILED $($_.Exception.Message)"
-  gcloud storage cp $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript.txt" 2>$null
   throw
 }
 finally {
-  Stop-Transcript | Out-Null
-  gcloud storage cp $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript.txt" 2>$null
+  try { Stop-Transcript | Out-Null } catch {}
+  Copy-ToGcsBestEffort $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript.txt"
 }

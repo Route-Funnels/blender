@@ -23,6 +23,7 @@ substitutions:
   _ZONE: "us-central1-a"
   _MACHINE_TYPE: "c3-standard-22"
   _DISK_SIZE_GB: "300"
+  _BOOT_DISK_TYPE: "pd-ssd"
   _REPO_URL: "https://github.com/blender/blender.git"
   _BASE_REF: "ab049163a6d5c937d62ed535b18f9af82de08554"
   _BUILD_ARGS: "release x64 ninja"
@@ -100,7 +101,7 @@ steps:
           --zone="${_ZONE}" \
           --machine-type="${_MACHINE_TYPE}" \
           --boot-disk-size="${_DISK_SIZE_GB}GB" \
-          --boot-disk-type="pd-ssd" \
+          --boot-disk-type="${_BOOT_DISK_TYPE}" \
           --image-family="windows-2022" \
           --image-project="windows-cloud" \
           --scopes="https://www.googleapis.com/auth/cloud-platform" \
