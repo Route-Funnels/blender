@@ -1,0 +1,154 @@
+# Google Cloud Build orchestration for producing a Windows blender.exe artifact.
+#
+# Cloud Build itself runs Linux containers, so this recipe creates a temporary
+# Windows Compute Engine VM, builds Blender on that VM, uploads artifacts to GCS,
+# and then deletes the VM.
+#
+# Required before submit:
+#   1. Pick/create an artifact bucket, for example:
+#        gsutil mb -p spotlessbinco -l us-central1 gs://YOUR_BUCKET
+#   2. Ensure the Cloud Build service account can manage Compute Engine and use
+#      the bucket. Typical roles: compute.instanceAdmin.v1, iam.serviceAccountUser,
+#      storage.objectAdmin.
+#
+# Submit example:
+#   gcloud builds submit --project spotlessbinco --config cloudbuild-windows.yaml \
+#     --substitutions=_ARTIFACT_BUCKET=gs://YOUR_BUCKET/blender-agent-mcp-windows
+#
+# Result:
+#   gs://YOUR_BUCKET/blender-agent-mcp-windows/$BUILD_ID/blender-agent-mcp-windows-x64.zip
+
+substitutions:
+  _ARTIFACT_BUCKET: ""
+  _ZONE: "us-central1-a"
+  _MACHINE_TYPE: "c3-standard-22"
+  _DISK_SIZE_GB: "300"
+  _REPO_URL: "https://github.com/blender/blender.git"
+  _BASE_REF: "ab049163a6d5c937d62ed535b18f9af82de08554"
+  _BUILD_ARGS: "release x64 ninja"
+  _VM_NAME_PREFIX: "blender-win"
+
+timeout: "28800s" # 8 hours
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: "package-agent-overlay"
+    name: "gcr.io/cloud-builders/gcloud"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        if [ -z "${_ARTIFACT_BUCKET}" ]; then
+          echo "ERROR: _ARTIFACT_BUCKET is required for Windows builds because the VM exchanges files through GCS." >&2
+          exit 1
+        fi
+
+        mkdir -p /workspace/windows-cloudbuild/overlay
+        cp /workspace/CMakeLists.txt /workspace/windows-cloudbuild/overlay/CMakeLists.txt
+        mkdir -p /workspace/windows-cloudbuild/overlay/source/creator
+        cp /workspace/source/creator/creator_args.cc /workspace/windows-cloudbuild/overlay/source/creator/creator_args.cc
+        mkdir -p /workspace/windows-cloudbuild/overlay/scripts/modules/_bpy_internal/agent_mcp
+        cp -R /workspace/scripts/modules/_bpy_internal/agent_mcp/. \
+          /workspace/windows-cloudbuild/overlay/scripts/modules/_bpy_internal/agent_mcp/
+        mkdir -p /workspace/windows-cloudbuild/overlay/build_files/cmake/config
+        cp /workspace/build_files/cmake/config/blender_codetether_windows.cmake \
+          /workspace/windows-cloudbuild/overlay/build_files/cmake/config/blender_codetether_windows.cmake
+        mkdir -p /workspace/windows-cloudbuild/overlay/tools
+        cp /workspace/tools/codetether_blender_automation.py \
+          /workspace/windows-cloudbuild/overlay/tools/codetether_blender_automation.py
+        cp /workspace/tools/codetether_windows_build.ps1 \
+          /workspace/windows-cloudbuild/overlay/tools/codetether_windows_build.ps1
+
+        tar -C /workspace/windows-cloudbuild/overlay -czf /workspace/windows-cloudbuild/agent-overlay.tar.gz .
+        gcloud storage cp /workspace/windows-cloudbuild/agent-overlay.tar.gz \
+          "${_ARTIFACT_BUCKET}/${BUILD_ID}/agent-overlay.tar.gz"
+
+        cp /workspace/build_files/codetether/windows_startup.ps1.in /workspace/windows-cloudbuild/startup.ps1
+
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path('/workspace/windows-cloudbuild/startup.ps1')
+        s = p.read_text()
+        replacements = {
+            '__BUILD_ID__': "${BUILD_ID}",
+            '__ARTIFACT_BUCKET__': "${_ARTIFACT_BUCKET}",
+            '__REPO_URL__': "${_REPO_URL}",
+            '__BASE_REF__': "${_BASE_REF}",
+            '__BUILD_ARGS__': "${_BUILD_ARGS}",
+        }
+        for k, v in replacements.items():
+            s = s.replace(k, v)
+        p.write_text(s)
+        PY
+
+        gcloud storage cp /workspace/windows-cloudbuild/startup.ps1 \
+          "${_ARTIFACT_BUCKET}/${BUILD_ID}/startup.ps1"
+
+  - id: "create-windows-builder-vm"
+    name: "gcr.io/cloud-builders/gcloud"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        VM_NAME="${_VM_NAME_PREFIX}-${BUILD_ID}"
+        VM_NAME="$${VM_NAME:0:62}"
+        echo "$${VM_NAME}" > /workspace/windows-cloudbuild/vm-name.txt
+
+        gcloud compute instances create "$${VM_NAME}" \
+          --zone="${_ZONE}" \
+          --machine-type="${_MACHINE_TYPE}" \
+          --boot-disk-size="${_DISK_SIZE_GB}GB" \
+          --boot-disk-type="pd-ssd" \
+          --image-family="windows-2022" \
+          --image-project="windows-cloud" \
+          --scopes="https://www.googleapis.com/auth/cloud-platform" \
+          --metadata-from-file=windows-startup-script-ps1=/workspace/windows-cloudbuild/startup.ps1
+
+  - id: "wait-for-windows-artifact"
+    name: "gcr.io/cloud-builders/gcloud"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        VM_NAME="$(cat /workspace/windows-cloudbuild/vm-name.txt)"
+        cleanup_vm() {
+          echo "Deleting Windows builder VM $${VM_NAME}"
+          gcloud compute instances delete "$${VM_NAME}" --zone="${_ZONE}" --quiet || true
+        }
+        trap cleanup_vm EXIT
+
+        deadline=$$((SECONDS + 27000))
+        while [ $$SECONDS -lt $$deadline ]; do
+          if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/blender-agent-mcp-windows-x64.zip" >/dev/null 2>&1; then
+            echo "Windows artifact is ready: ${_ARTIFACT_BUCKET}/${BUILD_ID}/blender-agent-mcp-windows-x64.zip"
+            gcloud storage cp "${_ARTIFACT_BUCKET}/${BUILD_ID}/agent_mcp_smoke_test_windows.json" /workspace/agent_mcp_smoke_test_windows.json || true
+            exit 0
+          fi
+
+          if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-transcript.txt" >/dev/null 2>&1; then
+            gcloud storage cp "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-transcript.txt" /workspace/windows-build-transcript.txt >/dev/null 2>&1 || true
+            if grep -q "WINDOWS_BUILD_FAILED" /workspace/windows-build-transcript.txt; then
+              tail -200 /workspace/windows-build-transcript.txt
+              exit 1
+            fi
+          fi
+
+          echo "Waiting for Windows VM $${VM_NAME} to upload artifact... elapsed=$${SECONDS}s"
+          sleep 60
+        done
+        echo "Timed out waiting for Windows artifact" >&2
+        gcloud compute instances get-serial-port-output "$${VM_NAME}" --zone="${_ZONE}" --port=1 | tail -300 || true
+        exit 1
+
+  - id: "delete-windows-builder-vm"
+    name: "gcr.io/cloud-builders/gcloud"
+    entrypoint: "bash"
+    args:
+      - "-ceu"
+      - |
+        if [ -f /workspace/windows-cloudbuild/vm-name.txt ]; then
+          VM_NAME="$(cat /workspace/windows-cloudbuild/vm-name.txt)"
+          gcloud compute instances delete "$${VM_NAME}" --zone="${_ZONE}" --quiet || true
+        fi

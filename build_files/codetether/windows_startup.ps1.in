@@ -1,0 +1,170 @@
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+if ([enum]::GetNames([Net.SecurityProtocolType]) -contains "Tls13") {
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+}
+
+function Write-Log($Message) {
+  $stamp = Get-Date -Format o
+  Write-Host "[$stamp] $Message"
+}
+
+function Add-ToMachinePath($PathToAdd) {
+  $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+  if ($machinePath -notlike "*$PathToAdd*") {
+    [Environment]::SetEnvironmentVariable("Path", "$machinePath;$PathToAdd", "Machine")
+  }
+  $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+}
+
+function Invoke-DownloadWithRetry($Uri, $OutFile, $Attempts = 5) {
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    try {
+      Write-Log "Downloading $Uri (attempt $attempt/$Attempts)"
+      Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -Headers @{ "User-Agent" = "CodeTether-Blender-Windows-Build" }
+      if ((Test-Path $OutFile) -and ((Get-Item $OutFile).Length -gt 0)) { return }
+      throw "Download produced an empty file: $OutFile"
+    }
+    catch {
+      if ($attempt -eq $Attempts) { throw }
+      $delay = [Math]::Min(60, 5 * $attempt)
+      Write-Log "Download failed: $($_.Exception.Message); retrying in $delay seconds"
+      Start-Sleep -Seconds $delay
+    }
+  }
+}
+
+$BuildId = "__BUILD_ID__"
+$ArtifactBucket = "__ARTIFACT_BUCKET__"
+$RepoUrl = "__REPO_URL__"
+$BaseRef = "__BASE_REF__"
+$BuildArgs = "__BUILD_ARGS__"
+$WorkDir = "C:\\blender-agent-build"
+$SourceDir = Join-Path $WorkDir "blender-src"
+$OverlayArchive = Join-Path $WorkDir "agent-overlay.tar.gz"
+$ArtifactDir = Join-Path $WorkDir "artifacts"
+$Transcript = Join-Path $WorkDir "windows-build-transcript.txt"
+
+New-Item -ItemType Directory -Force -Path $WorkDir, $ArtifactDir | Out-Null
+Start-Transcript -Path $Transcript -Force | Out-Null
+
+try {
+  Write-Log "Installing build tooling with winget/chocolatey/direct installers as needed"
+
+  if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
+    Write-Log "Installing Git"
+    $gitInstaller = Join-Path $WorkDir "Git-64-bit.exe"
+    Invoke-DownloadWithRetry "https://github.com/git-for-windows/git/releases/download/v2.51.2.windows.1/Git-2.51.2-64-bit.exe" $gitInstaller
+    Start-Process -FilePath $gitInstaller -ArgumentList "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-" -Wait
+    Add-ToMachinePath "C:\\Program Files\\Git\\cmd"
+  }
+
+  if (-not (Get-Command cmake.exe -ErrorAction SilentlyContinue)) {
+    Write-Log "Installing CMake"
+    $cmakeMsi = Join-Path $WorkDir "cmake.msi"
+    Invoke-DownloadWithRetry "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-windows-x86_64.msi" $cmakeMsi
+    Start-Process msiexec.exe -ArgumentList "/i", $cmakeMsi, "/qn", "/norestart", "ADD_CMAKE_TO_PATH=System" -Wait
+    Add-ToMachinePath "C:\\Program Files\\CMake\\bin"
+  }
+
+  if (-not (Get-Command ninja.exe -ErrorAction SilentlyContinue)) {
+    Write-Log "Installing Ninja"
+    $ninjaZip = Join-Path $WorkDir "ninja-win.zip"
+    $ninjaDir = "C:\\ninja"
+    Invoke-DownloadWithRetry "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip" $ninjaZip
+    New-Item -ItemType Directory -Force -Path $ninjaDir | Out-Null
+    Expand-Archive -Path $ninjaZip -DestinationPath $ninjaDir -Force
+    Add-ToMachinePath $ninjaDir
+  }
+
+  $vswhere = "${env:ProgramFiles(x86)}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+  $hasVS = (Test-Path $vswhere) -and (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+  if (-not $hasVS) {
+    Write-Log "Installing Visual Studio 2022 Build Tools"
+    $vsInstaller = Join-Path $WorkDir "vs_buildtools.exe"
+    Invoke-DownloadWithRetry "https://aka.ms/vs/17/release/vs_BuildTools.exe" $vsInstaller
+    Start-Process -FilePath $vsInstaller -ArgumentList @(
+      "--quiet", "--wait", "--norestart", "--nocache",
+      "--add", "Microsoft.VisualStudio.Workload.VCTools",
+      "--add", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+      "--add", "Microsoft.VisualStudio.Component.Windows11SDK.22621"
+    ) -Wait
+  }
+
+  Write-Log "Downloading agent overlay from GCS"
+  gcloud storage cp "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
+
+  Write-Log "Cloning Blender source"
+  git config --global core.longpaths true
+  git lfs install --skip-smudge
+  git clone --filter=blob:none $RepoUrl $SourceDir
+  git -C $SourceDir checkout $BaseRef
+  git -C $SourceDir submodule update --init --depth 1 scripts/addons_core
+
+  Write-Log "Fetching Windows dependency libraries non-interactively"
+  git -C $SourceDir config --local submodule.lib/windows_x64.update checkout
+  $env:GIT_LFS_SKIP_SMUDGE = "1"
+  git -C $SourceDir submodule update --progress --init lib/windows_x64
+  if ($LASTEXITCODE -ne 0) { throw "lib/windows_x64 submodule update failed with exit code $LASTEXITCODE" }
+  Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
+  git -C (Join-Path $SourceDir "lib/windows_x64") lfs pull
+  if ($LASTEXITCODE -ne 0) { throw "lib/windows_x64 git lfs pull failed with exit code $LASTEXITCODE" }
+
+  Write-Log "Applying agent overlay"
+  tar -xzf $OverlayArchive -C $SourceDir
+
+  Write-Log "Running make.bat update to fetch Windows libraries"
+  Push-Location $SourceDir
+  cmd.exe /c "make.bat update"
+  if ($LASTEXITCODE -ne 0) { throw "make.bat update failed with exit code $LASTEXITCODE" }
+
+  Write-Log "Building Blender with args: $BuildArgs"
+  cmd.exe /c "make.bat $BuildArgs"
+  if ($LASTEXITCODE -ne 0) { throw "make.bat build failed with exit code $LASTEXITCODE" }
+  Pop-Location
+
+  $Exe = Get-ChildItem -Path "C:\\" -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match "build_windows.*bin|build_windows.*Release|build_windows.*install" } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if (-not $Exe) {
+    $Exe = Get-ChildItem -Path (Join-Path $SourceDir "..") -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending |
+      Select-Object -First 1
+  }
+  if (-not $Exe) { throw "Could not locate blender.exe after build" }
+
+  Write-Log "Found blender.exe at $($Exe.FullName)"
+  $Smoke = Join-Path $ArtifactDir "agent_mcp_smoke_test_windows.json"
+  '{"jsonrpc":"2.0","id":1,"method":"status","params":{}}' |
+    & $Exe.FullName --background --agent-mcp | Tee-Object -FilePath $Smoke
+  if (-not (Select-String -Path $Smoke -Pattern '"blender_version"' -Quiet)) {
+    throw "Agent MCP smoke test did not report blender_version"
+  }
+
+  $PackageRoot = Join-Path $ArtifactDir "blender-agent-mcp-windows-x64"
+  New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
+  $BinDir = $Exe.Directory.FullName
+  Write-Log "Packaging from $BinDir"
+  Copy-Item -Path (Join-Path $BinDir "*") -Destination $PackageRoot -Recurse -Force
+  Copy-Item -Path $Smoke -Destination $PackageRoot -Force
+  Copy-Item -Path (Join-Path $SourceDir "tools\\codetether_blender_automation.py") -Destination (Join-Path $PackageRoot "codetether_blender_automation.py") -Force
+
+  $ZipPath = Join-Path $ArtifactDir "blender-agent-mcp-windows-x64.zip"
+  Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -Force
+  Write-Log "Uploading artifact $ZipPath"
+  gcloud storage cp $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
+  gcloud storage cp $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
+
+  Write-Log "WINDOWS_BUILD_SUCCESS artifact=$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
+}
+catch {
+  Write-Log "WINDOWS_BUILD_FAILED $($_.Exception.Message)"
+  gcloud storage cp $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript.txt" 2>$null
+  throw
+}
+finally {
+  Stop-Transcript | Out-Null
+  gcloud storage cp $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript.txt" 2>$null
+}

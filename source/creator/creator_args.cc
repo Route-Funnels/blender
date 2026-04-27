@@ -722,6 +722,7 @@ static void print_help(bArgs *ba, bool all)
   BLI_args_print_arg_doc(ba, "--python-text");
   BLI_args_print_arg_doc(ba, "--python-expr");
   BLI_args_print_arg_doc(ba, "--python-console");
+  BLI_args_print_arg_doc(ba, "--agent-mcp");
   BLI_args_print_arg_doc(ba, "--python-exit-code");
   BLI_args_print_arg_doc(ba, "--python-use-system-env");
   BLI_args_print_arg_doc(ba, "--python-use-user-env");
@@ -2696,6 +2697,32 @@ static int arg_handle_python_console_run(int /*argc*/, const char ** /*argv*/, v
   return 0;
 }
 
+static const char arg_handle_agent_mcp_run_doc[] =
+    "\n\t"
+    "Run Blender's built-in agent MCP stdio server. "
+    "Use with '--enable-event-simulate' for mouse and keyboard event tools.";
+static int arg_handle_agent_mcp_run(int /*argc*/, const char ** /*argv*/, void *data)
+{
+  bContext *C = static_cast<bContext *>(data);
+#  ifdef WITH_PYTHON
+  bool ok;
+  BPY_CTX_SETUP(ok = BPY_run_string_exec(
+                    C,
+                    nullptr,
+                    "from _bpy_internal.agent_mcp.server import main\n"
+                    "main()"));
+  if (!ok && app_state.exit_code_on_error.python) {
+    fprintf(stderr, "\nError: agent MCP server failed, exiting.\n");
+    WM_exit(C, app_state.exit_code_on_error.python);
+  }
+#  else
+  UNUSED_VARS(C);
+  fprintf(stderr, "This Blender was built without python support\n");
+#  endif /* WITH_PYTHON */
+
+  return 0;
+}
+
 static const char arg_handle_python_exit_code_set_doc[] =
     "<code>\n"
     "\tSet the exit-code in [0..255] to exit if a Python exception is raised\n"
@@ -3239,6 +3266,7 @@ void main_args_setup(bContext *C, bArgs *ba, bool all)
   BLI_args_add(ba, nullptr, "--python-text", CB(arg_handle_python_text_run), C);
   BLI_args_add(ba, nullptr, "--python-expr", CB(arg_handle_python_expr_run), C);
   BLI_args_add(ba, nullptr, "--python-console", CB(arg_handle_python_console_run), C);
+  BLI_args_add(ba, nullptr, "--agent-mcp", CB(arg_handle_agent_mcp_run), C);
   BLI_args_add(ba, nullptr, "--python-exit-code", CB(arg_handle_python_exit_code_set), nullptr);
   BLI_args_add(ba, nullptr, "--addons", CB(arg_handle_addons_set), C);
 

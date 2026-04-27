@@ -90,10 +90,16 @@ enable_testing()
 # error while it is trying to load the startup.blend file. For now just
 # check this file is over 1KB in size, and throw out a fatal error otherwise.
 
+option(WITH_AGENT_MCP_ALLOW_INCOMPLETE_LFS "Allow building the headless Agent MCP binary from a Git checkout with unresolved LFS pointer files." OFF)
+
 if(EXISTS ${CMAKE_SOURCE_DIR}/release/datafiles/startup.blend)
   file(SIZE ${CMAKE_SOURCE_DIR}/release/datafiles/startup.blend startup_size)
   if(${startup_size} LESS 1024)
-    message(FATAL_ERROR "Detected incomplete startup blend, likely due to missing Git LFS checkout.\nRunning \"make update\" or \"git lfs pull\" may resolve the issue.")
+    if(WITH_AGENT_MCP_ALLOW_INCOMPLETE_LFS)
+      message(WARNING "Detected incomplete startup blend due to missing Git LFS checkout; continuing because WITH_AGENT_MCP_ALLOW_INCOMPLETE_LFS is enabled.")
+    else()
+      message(FATAL_ERROR "Detected incomplete startup blend, likely due to missing Git LFS checkout.\nRunning \"make update\" or \"git lfs pull\" may resolve the issue.")
+    endif()
   endif()
   unset(startup_size)
 endif()
