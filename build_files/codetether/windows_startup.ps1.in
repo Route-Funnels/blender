@@ -60,15 +60,51 @@ function Invoke-LoggedCommand {
   # Start-Process cannot execute those reliably as native Win32 applications.
   $stdout = [System.IO.Path]::GetTempFileName()
   $stderr = [System.IO.Path]::GetTempFileName()
+  $cmdScript = [System.IO.Path]::ChangeExtension([System.IO.Path]::GetTempFileName(), ".cmd")
   try {
+    $resolvedPath = $FilePath
     $resolved = Get-Command $FilePath -ErrorAction SilentlyContinue
-    if ($resolved -and $resolved.Source) { $resolvedPath = $resolved.Source } else { $resolvedPath = $FilePath }
+    if ($resolved -and $resolved.Source) { $resolvedPath = $resolved.Source }
 
-    $cmdLine = ConvertTo-CmdArgument $resolvedPath
+    # PowerShell may resolve command shims to extensionless files or .ps1 files,
+    # which cmd.exe cannot execute with `call`. Prefer the corresponding .cmd
+    # shim when present (notably for Google Cloud SDK's gcloud.cmd).
+    if ($resolvedPath -notmatch '\.(exe|cmd|bat)$') {
+      $cmdCandidate = "$resolvedPath.cmd"
+      if (Test-Path $cmdCandidate) { $resolvedPath = $cmdCandidate }
+    }
+    if ($FilePath -eq "gcloud") {
+      $gcloudCandidates = @(
+        "C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+        "C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+      )
+      foreach ($candidate in $gcloudCandidates) {
+        if (Test-Path $candidate) { $resolvedPath = $candidate; break }
+      }
+    }
+    Write-Log "Resolved command path: $FilePath -> $resolvedPath"
+
+    # Use `call` so .cmd/.bat shims (notably gcloud.cmd) execute correctly,
+    # and avoid `cmd /s` because it strips quotes around paths such as
+    # `C:\Program Files\...\gcloud.cmd` in this invocation shape.
+    $cmdLine = 'call ' + (ConvertTo-CmdArgument $resolvedPath)
     foreach ($arg in $Arguments) {
       $cmdLine += ' ' + (ConvertTo-CmdArgument $arg)
     }
-    $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/d", "/s", "/c", $cmdLine) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "cmd.exe"
+    [System.IO.File]::WriteAllText($cmdScript, "@echo off`r`n$cmdLine`r`nexit /b %ERRORLEVEL%`r`n")
+    $psi.Arguments = "/d /c " + (ConvertTo-CmdArgument $cmdScript)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $stdOutText = $process.StandardOutput.ReadToEnd()
+    $stdErrText = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    [System.IO.File]::WriteAllText($stdout, $stdOutText)
+    [System.IO.File]::WriteAllText($stderr, $stdErrText)
 
     if (Test-Path $stdout) { Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
     if (Test-Path $stderr) { Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } }
@@ -79,15 +115,59 @@ function Invoke-LoggedCommand {
   }
   finally {
     Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    Remove-Item $cmdScript -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Get-GceAccessToken {
+  $metadataHeaders = @{ "Metadata-Flavor" = "Google" }
+  $tokenResponse = Invoke-RestMethod `
+    -Uri "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" `
+    -Headers $metadataHeaders `
+    -UseBasicParsing
+  return $tokenResponse.access_token
+}
+
+function Split-GcsUri([string]$Uri) {
+  if ($Uri -notmatch '^gs://([^/]+)/(.+)$') { throw "Invalid GCS URI: $Uri" }
+  return @{ Bucket = $Matches[1]; Object = $Matches[2] }
+}
+
+function Copy-FromGcs($Source, $Destination) {
+  $parts = Split-GcsUri $Source
+  $token = Get-GceAccessToken
+  $encodedObject = [System.Uri]::EscapeDataString($parts.Object)
+  $url = "https://storage.googleapis.com/storage/v1/b/$($parts.Bucket)/o/$encodedObject?alt=media"
+  Write-Log "Downloading $Source to $Destination"
+  Invoke-WebRequest `
+    -Uri $url `
+    -OutFile $Destination `
+    -Headers @{ Authorization = "Bearer $token"; "User-Agent" = "CodeTether-Blender-Windows-Build" } `
+    -UseBasicParsing
+  if (-not (Test-Path $Destination)) { throw "GCS download did not create $Destination" }
+}
+
+function Copy-ToGcs($Source, $Destination) {
+  if (-not (Test-Path $Source)) { throw "Cannot upload missing file: $Source" }
+  $parts = Split-GcsUri $Destination
+  $token = Get-GceAccessToken
+  $encodedObject = [System.Uri]::EscapeDataString($parts.Object)
+  $url = "https://storage.googleapis.com/upload/storage/v1/b/$($parts.Bucket)/o?uploadType=media&name=$encodedObject"
+  Write-Log "Uploading $Source to $Destination"
+  Invoke-WebRequest `
+    -Uri $url `
+    -Method Post `
+    -InFile $Source `
+    -ContentType "application/octet-stream" `
+    -Headers @{ Authorization = "Bearer $token"; "User-Agent" = "CodeTether-Blender-Windows-Build" } `
+    -UseBasicParsing | Out-Null
 }
 
 function Copy-ToGcsBestEffort($Source, $Destination) {
   try {
     if (Test-Path $Source) {
-      Write-Log "Uploading $Source to $Destination"
       try {
-        Invoke-LoggedCommand gcloud storage cp $Source $Destination
+        Copy-ToGcs $Source $Destination
       }
       catch {
         Write-Log "WARNING: failed to upload ${Source}: $($_.Exception.Message)"
@@ -157,7 +237,7 @@ try {
   }
 
   Write-Log "Downloading agent overlay from GCS"
-  Invoke-LoggedCommand gcloud storage cp "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
+  Copy-FromGcs "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
 
   Write-Log "Cloning Blender source"
   Invoke-LoggedCommand git config --global core.longpaths true
@@ -212,9 +292,8 @@ try {
 
   $ZipPath = Join-Path $ArtifactDir "blender-agent-mcp-windows-x64.zip"
   Compress-Archive -Path (Join-Path $PackageRoot "*") -DestinationPath $ZipPath -Force
-  Write-Log "Uploading artifact $ZipPath"
-  Invoke-LoggedCommand gcloud storage cp $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
-  Invoke-LoggedCommand gcloud storage cp $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
+  Copy-ToGcs $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
+  Copy-ToGcs $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
 
   Write-Log "WINDOWS_BUILD_SUCCESS artifact=$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
 }
