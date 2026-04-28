@@ -40,7 +40,7 @@ jobs:
           git lfs install --skip-smudge
           ninja --version
           cmake --version
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installervswhere.exe'
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
           if (!(Test-Path $vswhere)) { throw 'vswhere.exe not found' }
           Write-Host 'Installed Visual Studio instances:'
           & $vswhere -all -format json
