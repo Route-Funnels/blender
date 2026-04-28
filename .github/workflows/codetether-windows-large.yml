@@ -42,11 +42,16 @@ jobs:
           git lfs fetch blender-project-lfs --include="release/datafiles/**,scripts/startup/bl_app_templates_system/**,assets/**" --exclude="tests/**"
           git lfs checkout
 
-      - name: Install and verify build tools
+      - name: Verify build tools
         shell: pwsh
         run: |
-          choco install ninja cmake git-lfs -y --no-progress
+          foreach ($tool in @('git', 'git-lfs', 'ninja', 'cmake')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool was not found on PATH"
+            }
+          }
           git lfs install --skip-smudge
+          git lfs version
           ninja --version
           cmake --version
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
@@ -74,7 +79,6 @@ jobs:
           call make.bat %BUILD_ARGS%
 
       - name: Locate blender.exe
-        if: always()
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path .. -Recurse -Filter blender.exe -ErrorAction SilentlyContinue |
