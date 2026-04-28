@@ -33,13 +33,20 @@ jobs:
           lfs: false
           submodules: false
 
-      - name: Install build tools
+      - name: Install and verify build tools
         shell: pwsh
         run: |
           choco install ninja cmake git-lfs -y --no-progress
           git lfs install --skip-smudge
           ninja --version
           cmake --version
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installerswhere.exe'
+          if (!(Test-Path $vswhere)) { throw 'vswhere.exe not found' }
+          Write-Host 'Installed Visual Studio instances:'
+          & $vswhere -all -format json
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vsInstall) { throw 'MSVC x64 tools not found on runner' }
+          Write-Host "Using Visual Studio at $vsInstall"
 
       - name: Fetch Blender Windows libraries
         shell: pwsh
