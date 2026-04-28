@@ -13,7 +13,7 @@ jobs:
     name: Build Windows Blender on large runner
     # Larger GitHub-hosted Windows runner. If unavailable for the fork/org,
     # change to windows-latest or another configured larger-runner label.
-    runs-on: windows-latest-16-cores
+    runs-on: windows-latest
     timeout-minutes: 360
 
     env:
