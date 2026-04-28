@@ -36,9 +36,9 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
-          git config --local lfs.remote.searchall true
           git remote add lfs-fallback https://projects.blender.org/blender/blender.git
-          git lfs pull --include=release/datafiles/**,scripts/startup/bl_app_templates_system/**,assets/** --exclude=tests/**
+          git lfs fetch lfs-fallback --include="release/datafiles/**,scripts/startup/bl_app_templates_system/**,assets/**" --exclude="tests/**"
+          git lfs checkout
 
       - name: Install and verify build tools
         shell: pwsh
