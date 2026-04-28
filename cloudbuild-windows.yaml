@@ -161,11 +161,36 @@ steps:
         trap cleanup_vm EXIT
 
         deadline=$$((SECONDS + 27000))
+        last_progress=""
+        last_live_size=0
         while [ $$SECONDS -lt $$deadline ]; do
           if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/blender-agent-mcp-windows-x64.zip" >/dev/null 2>&1; then
             echo "Windows artifact is ready: ${_ARTIFACT_BUCKET}/${BUILD_ID}/blender-agent-mcp-windows-x64.zip"
             gcloud storage cp "${_ARTIFACT_BUCKET}/${BUILD_ID}/agent_mcp_smoke_test_windows.json" /workspace/agent_mcp_smoke_test_windows.json || true
             exit 0
+          fi
+
+          if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-progress.txt" >/dev/null 2>&1; then
+            gcloud storage cp "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-progress.txt" /workspace/windows-build-progress.txt >/dev/null 2>&1 || true
+            progress="$$(cat /workspace/windows-build-progress.txt 2>/dev/null || true)"
+            if [ -n "$${progress}" ] && [ "$${progress}" != "$${last_progress}" ]; then
+              echo "Windows build progress: $${progress}"
+              last_progress="$${progress}"
+            fi
+          fi
+
+          if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-transcript-live.txt" >/dev/null 2>&1; then
+            gcloud storage cp "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-transcript-live.txt" /workspace/windows-build-transcript-live.txt >/dev/null 2>&1 || true
+            live_size="$$(wc -c < /workspace/windows-build-transcript-live.txt 2>/dev/null || echo 0)"
+            if [ "$${live_size}" != "$${last_live_size}" ]; then
+              echo "Recent live Windows transcript output:"
+              tail -80 /workspace/windows-build-transcript-live.txt || true
+              last_live_size="$${live_size}"
+            fi
+            if grep -q "WINDOWS_BUILD_FAILED" /workspace/windows-build-transcript-live.txt; then
+              tail -200 /workspace/windows-build-transcript-live.txt
+              exit 1
+            fi
           fi
 
           if gcloud storage ls "${_ARTIFACT_BUCKET}/${BUILD_ID}/windows-build-transcript.txt" >/dev/null 2>&1; then

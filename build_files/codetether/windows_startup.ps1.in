@@ -10,6 +10,18 @@ function Write-Log($Message) {
   Write-Host "[$stamp] $Message"
 }
 
+function Write-ProgressSnapshot($Stage) {
+  try {
+    if ($script:ProgressFile) {
+      $stamp = Get-Date -Format o
+      [System.IO.File]::WriteAllText($script:ProgressFile, "${stamp}`t${Stage}`r`n")
+    }
+  }
+  catch {
+    Write-Log "WARNING: failed to write progress snapshot: $($_.Exception.Message)"
+  }
+}
+
 function Add-ToMachinePath($PathToAdd) {
   $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
   if ($machinePath -notlike "*$PathToAdd*") {
@@ -169,20 +181,53 @@ function Copy-ToGcs($Source, $Destination) {
     -UseBasicParsing | Out-Null
 }
 
+function Copy-FileSnapshot($Source, $Destination) {
+  # Start-Transcript keeps its file open. Read it with a permissive share mode so
+  # live transcript uploads can still work while the transcript is active.
+  $sourceStream = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+  try {
+    $destStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try { $sourceStream.CopyTo($destStream) }
+    finally { $destStream.Dispose() }
+  }
+  finally { $sourceStream.Dispose() }
+}
+
 function Copy-ToGcsBestEffort($Source, $Destination) {
   try {
     if (Test-Path $Source) {
+      $uploadSource = $Source
+      $snapshot = $null
       try {
-        Copy-ToGcs $Source $Destination
+        $snapshot = [System.IO.Path]::GetTempFileName()
+        Copy-FileSnapshot $Source $snapshot
+        $uploadSource = $snapshot
+      }
+      catch {
+        Write-Log "WARNING: failed to snapshot ${Source}; uploading directly: $($_.Exception.Message)"
+      }
+      try {
+        Copy-ToGcs $uploadSource $Destination
       }
       catch {
         Write-Log "WARNING: failed to upload ${Source}: $($_.Exception.Message)"
+      }
+      finally {
+        if ($snapshot) { Remove-Item $snapshot -Force -ErrorAction SilentlyContinue }
       }
     }
   }
   catch {
     Write-Log "WARNING: unexpected upload helper error for ${Source}: $($_.Exception.Message)"
   }
+}
+
+function Publish-BuildStatus($Stage) {
+  Write-ProgressSnapshot $Stage
+  if ($script:ProgressFile) {
+    Copy-ToGcsBestEffort $script:ProgressFile "$ArtifactBucket/$BuildId/windows-build-progress.txt"
+  }
+  Copy-ToGcsBestEffort $Transcript "$ArtifactBucket/$BuildId/windows-build-transcript-live.txt"
 }
 
 $BuildId = "__BUILD_ID__"
@@ -196,11 +241,13 @@ $SourceDir = Join-Path $WorkDir "blender-src"
 $OverlayArchive = Join-Path $WorkDir "agent-overlay.tar.gz"
 $ArtifactDir = Join-Path $WorkDir "artifacts"
 $Transcript = Join-Path $WorkDir "windows-build-transcript.txt"
+$script:ProgressFile = Join-Path $WorkDir "windows-build-progress.txt"
 
 New-Item -ItemType Directory -Force -Path $WorkDir, $ArtifactDir | Out-Null
 Start-Transcript -Path $Transcript -Force | Out-Null
 
 try {
+  Publish-BuildStatus "startup"
   Write-Log "Installing build tooling with winget/chocolatey/direct installers as needed"
 
   if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
@@ -258,6 +305,7 @@ try {
     Add-ToMachinePath "C:\BuildTools\VC\Tools\MSVC"
   }
 
+  Publish-BuildStatus "tooling-installed"
   if (-not (Test-Path $vswhere)) {
     throw "vswhere.exe was not found after Visual Studio Build Tools installation"
   }
@@ -271,9 +319,11 @@ try {
     throw "vcvars64.bat was not found at $vcvars64"
   }
 
+  Publish-BuildStatus "downloading-overlay"
   Write-Log "Downloading agent overlay from GCS"
   Copy-FromGcs "$ArtifactBucket/$BuildId/agent-overlay.tar.gz" $OverlayArchive
 
+  Publish-BuildStatus "cloning-source"
   Write-Log "Cloning Blender source"
   Invoke-LoggedCommand git config --global core.longpaths true
   Invoke-LoggedCommand git lfs install --skip-smudge
@@ -281,6 +331,7 @@ try {
   Invoke-LoggedCommand git -C $SourceDir checkout $BaseRef
   Invoke-LoggedCommand git -C $SourceDir submodule update --init --depth 1 scripts/addons_core
 
+  Publish-BuildStatus "fetching-windows-dependencies"
   Write-Log "Fetching Windows dependency libraries non-interactively"
   Invoke-LoggedCommand git -C $SourceDir config --local submodule.lib/windows_x64.update checkout
   $env:GIT_LFS_SKIP_SMUDGE = "1"
@@ -288,16 +339,19 @@ try {
   Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
   Invoke-LoggedCommand git -C (Join-Path $SourceDir "lib/windows_x64") lfs pull
 
+  Publish-BuildStatus "applying-overlay"
   Write-Log "Applying agent overlay"
   tar -xzf $OverlayArchive -C $SourceDir
 
   Write-Log "Skipping make.bat update because lib/windows_x64 was fetched explicitly above"
   Push-Location $SourceDir
 
+  Publish-BuildStatus "building"
   Write-Log "Building Blender with args: $BuildArgs"
   Invoke-LoggedCommand .\make.bat @BuildArgList
   Pop-Location
 
+  Publish-BuildStatus "locating-blender-exe"
   $Exe = Get-ChildItem -Path "C:\" -Filter blender.exe -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -match "build_windows.*bin|build_windows.*Release|build_windows.*install" } |
     Sort-Object LastWriteTime -Descending |
@@ -309,6 +363,7 @@ try {
   }
   if (-not $Exe) { throw "Could not locate blender.exe after build" }
 
+  Publish-BuildStatus "smoke-test"
   Write-Log "Found blender.exe at $($Exe.FullName)"
   $Smoke = Join-Path $ArtifactDir "agent_mcp_smoke_test_windows.json"
   '{"jsonrpc":"2.0","id":1,"method":"status","params":{}}' |
@@ -317,6 +372,7 @@ try {
     throw "Agent MCP smoke test did not report blender_version"
   }
 
+  Publish-BuildStatus "packaging"
   $PackageRoot = Join-Path $ArtifactDir "blender-agent-mcp-windows-x64"
   New-Item -ItemType Directory -Force -Path $PackageRoot | Out-Null
   $BinDir = $Exe.Directory.FullName
@@ -330,9 +386,11 @@ try {
   Copy-ToGcs $ZipPath "$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
   Copy-ToGcs $Smoke "$ArtifactBucket/$BuildId/agent_mcp_smoke_test_windows.json"
 
+  Publish-BuildStatus "success"
   Write-Log "WINDOWS_BUILD_SUCCESS artifact=$ArtifactBucket/$BuildId/blender-agent-mcp-windows-x64.zip"
 }
 catch {
+  Publish-BuildStatus "failed"
   Write-Log "WINDOWS_BUILD_FAILED $($_.Exception.Message)"
   throw
 }

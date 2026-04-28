@@ -11,6 +11,7 @@
 #  include <cerrno>
 #  include <cstdlib>
 #  include <cstring>
+#  include <string>
 
 #  include "MEM_guardedalloc.h"
 
@@ -2697,6 +2698,56 @@ static int arg_handle_python_console_run(int /*argc*/, const char ** /*argv*/, v
   return 0;
 }
 
+
+static std::string arg_as_python_string_literal(const char *arg)
+{
+  std::string result = "\"";
+  for (const char *ch = arg; *ch; ch++) {
+    switch (*ch) {
+      case '\\':
+        result += "\\\\";
+        break;
+      case '"':
+        result += "\\\"";
+        break;
+      case '\n':
+        result += "\\n";
+        break;
+      case '\r':
+        result += "\\r";
+        break;
+      case '\t':
+        result += "\\t";
+        break;
+      default:
+        result += *ch;
+        break;
+    }
+  }
+  result += "\"";
+  return result;
+}
+
+static bool arg_handle_agent_python_main(bContext *C, const std::string &argv_literal, const char *error_message)
+{
+#  ifdef WITH_PYTHON
+  bool ok;
+  const std::string code = "from _bpy_internal.agent_mcp.server import main\n"
+                           "raise SystemExit(main(" +
+                           argv_literal + "))";
+  BPY_CTX_SETUP(ok = BPY_run_string_exec(C, nullptr, code.c_str()));
+  if (!ok && app_state.exit_code_on_error.python) {
+    fprintf(stderr, "\nError: %s, exiting.\n", error_message);
+    WM_exit(C, app_state.exit_code_on_error.python);
+  }
+  return ok;
+#  else
+  UNUSED_VARS(C, argv_literal, error_message);
+  fprintf(stderr, "This Blender was built without python support\n");
+  return false;
+#  endif /* WITH_PYTHON */
+}
+
 static const char arg_handle_agent_mcp_run_doc[] =
     "\n\t"
     "Run Blender's built-in agent MCP stdio server. "
@@ -2704,22 +2755,38 @@ static const char arg_handle_agent_mcp_run_doc[] =
 static int arg_handle_agent_mcp_run(int /*argc*/, const char ** /*argv*/, void *data)
 {
   bContext *C = static_cast<bContext *>(data);
-#  ifdef WITH_PYTHON
-  bool ok;
-  BPY_CTX_SETUP(ok = BPY_run_string_exec(
-                    C,
-                    nullptr,
-                    "from _bpy_internal.agent_mcp.server import main\n"
-                    "main()"));
-  if (!ok && app_state.exit_code_on_error.python) {
-    fprintf(stderr, "\nError: agent MCP server failed, exiting.\n");
-    WM_exit(C, app_state.exit_code_on_error.python);
-  }
-#  else
-  UNUSED_VARS(C);
-  fprintf(stderr, "This Blender was built without python support\n");
-#  endif /* WITH_PYTHON */
+  arg_handle_agent_python_main(C, "[]", "agent MCP server failed");
+  return 0;
+}
 
+static const char arg_handle_agent_run_doc[] =
+    "<plan.json>\n"
+    "\tRun a built-in agent automation JSON plan, print a JSON result, and exit.\n"
+    "\tThe JSON may be a command object, a command array, or an object with commands/steps.";
+static int arg_handle_agent_run(int argc, const char **argv, void *data)
+{
+  bContext *C = static_cast<bContext *>(data);
+  if (argc > 1) {
+    arg_handle_agent_python_main(
+        C, "[\"--run\", " + arg_as_python_string_literal(argv[1]) + "]", "agent JSON plan failed");
+    return 1;
+  }
+  fprintf(stderr, "\nError: you must specify a JSON plan filepath after '%s'.\n", argv[0]);
+  return 0;
+}
+
+static const char arg_handle_agent_command_doc[] =
+    "<json>\n"
+    "\tRun one built-in agent automation JSON command or plan, print a JSON result, and exit.";
+static int arg_handle_agent_command(int argc, const char **argv, void *data)
+{
+  bContext *C = static_cast<bContext *>(data);
+  if (argc > 1) {
+    arg_handle_agent_python_main(
+        C, "[\"--command\", " + arg_as_python_string_literal(argv[1]) + "]", "agent JSON command failed");
+    return 1;
+  }
+  fprintf(stderr, "\nError: you must specify JSON after '%s'.\n", argv[0]);
   return 0;
 }
 
@@ -3267,6 +3334,8 @@ void main_args_setup(bContext *C, bArgs *ba, bool all)
   BLI_args_add(ba, nullptr, "--python-expr", CB(arg_handle_python_expr_run), C);
   BLI_args_add(ba, nullptr, "--python-console", CB(arg_handle_python_console_run), C);
   BLI_args_add(ba, nullptr, "--agent-mcp", CB(arg_handle_agent_mcp_run), C);
+  BLI_args_add(ba, nullptr, "--agent-run", CB(arg_handle_agent_run), C);
+  BLI_args_add(ba, nullptr, "--agent-command", CB(arg_handle_agent_command), C);
   BLI_args_add(ba, nullptr, "--python-exit-code", CB(arg_handle_python_exit_code_set), nullptr);
   BLI_args_add(ba, nullptr, "--addons", CB(arg_handle_addons_set), C);
 
