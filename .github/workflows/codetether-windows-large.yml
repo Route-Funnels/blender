@@ -33,6 +33,12 @@ jobs:
           lfs: false
           submodules: false
 
+      - name: Fetch Blender source LFS files
+        shell: pwsh
+        run: |
+          Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
+          git lfs pull
+
       - name: Install and verify build tools
         shell: pwsh
         run: |
