@@ -8,9 +8,9 @@ on:
         required: false
         default: 'lite x64 2022 ninja verbose'
       runner:
-        description: 'Runner label to use. Defaults to GitHub-hosted Windows 2022.'
+        description: 'Runner label to use. Depot Windows runners avoid GitHub larger-runner queue delays.'
         required: false
-        default: 'windows-2022'
+        default: 'depot-windows-2022-16'
 
 jobs:
   build-windows:
