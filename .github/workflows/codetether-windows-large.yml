@@ -10,7 +10,7 @@ on:
 
 jobs:
   build-windows:
-    name: Build Windows Blender on large runner
+    name: Build Windows Blender on Windows runner
     # Larger GitHub-hosted Windows runner. If unavailable for the fork/org,
     # change to windows-latest or another configured larger-runner label.
     runs-on: windows-latest
