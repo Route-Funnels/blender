@@ -36,8 +36,8 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item Env:\GIT_LFS_SKIP_SMUDGE -ErrorAction SilentlyContinue
-          git remote add blender-upstream https://github.com/blender/blender.git
-          git lfs pull blender-upstream
+          git config --local lfs.url https://github.com/blender/blender.git/info/lfs
+          git lfs pull --include=release/datafiles/**,scripts/startup/bl_app_templates_system/**,assets/** --exclude=tests/**
 
       - name: Install and verify build tools
         shell: pwsh
