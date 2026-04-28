@@ -17,7 +17,6 @@ jobs:
     timeout-minutes: 360
 
     env:
-      GIT_LFS_SKIP_SMUDGE: '1'
       BUILD_ARGS: ${{ inputs.build_args }}
       CODETETHER_PACKAGE_NAME: blender-codetether-windows-x64
 
