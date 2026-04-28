@@ -8,9 +8,9 @@ on:
         required: false
         default: 'lite x64 2022 ninja verbose'
       runner:
-        description: 'Runner label to use. Defaults to Depot Windows 2022 16-core for fast Blender builds.'
+        description: 'Runner label to use. Defaults to GitHub-hosted Windows 2022.'
         required: false
-        default: 'depot-windows-2022-16'
+        default: 'windows-2022'
 
 jobs:
   build-windows:
